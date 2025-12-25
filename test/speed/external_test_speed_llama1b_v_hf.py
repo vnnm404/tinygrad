@@ -11,11 +11,14 @@ torch.set_num_threads(1)
 np.set_printoptions(linewidth=160)
 from transformers import LlamaForCausalLM, LlamaConfig, LogitsProcessorList, TopKLogitsWarper, TopPLogitsWarper, TemperatureLogitsWarper
 from extra.models.llama import Transformer as TinygradTransformer, convert_from_huggingface
-from tinygrad import Tensor, Device
+from tinygrad import Tensor, Device, GlobalCounters
 from tinygrad.nn.state import get_state_dict, load_state_dict
 from tinygrad.helpers import colorize_float, getenv
 from tabulate import tabulate
 from tqdm import tqdm
+
+# plot flag
+PLOT = bool(int(getenv("PLOT", 0)))
 
 TORCHCOMPILE = bool(int(getenv("TORCHCOMPILE", 1)))
 CNT = getenv("CNT", 10)
@@ -109,13 +112,18 @@ def benchmark_tinygrad(model, start_tok, warmup=WARMUP, iters=CNT):
     tok_tensor.assign(Tensor([[last_tok]])).realize()
 
   times = []
+  mems = []
   for i in tqdm(range(iters), desc="Tinygrad Decoding"):
+    GlobalCounters.reset()
     st = time.perf_counter()
     last_tok = model(tok_tensor, warmup + i, TEMPERATURE, TOP_K, TOP_P, ALPHA_F, ALPHA_P).item()
-    times.append(time.perf_counter() - st)
+    elapsed = time.perf_counter() - st
+    times.append(elapsed)
+    # GlobalCounters.global_mem is bytes accessed; record for GB/s computation
+    mems.append(getattr(GlobalCounters, "global_mem", 0))
     tok_tensor.assign(Tensor([[last_tok]])).realize()
     toks.append(last_tok)
-  return times, toks
+  return times, toks, mems
 
 def copy_weights_hf_to_tinygrad(hf_model, tiny_model):
   """Copy weights from HuggingFace model to tinygrad model using convert_from_huggingface."""
@@ -194,7 +202,7 @@ class TestLlamaBenchmark(BaseLlamaTest):
 
     # tinygrad benchmark
     self.reset_kv()
-    tiny_times, tiny_toks = benchmark_tinygrad(self.tiny_model, self.start_tok)
+    tiny_times, tiny_toks, tiny_mems = benchmark_tinygrad(self.tiny_model, self.start_tok)
 
     # note: tokens may differ due to different RoPE implementations or numerical differences
     # but we still report them for debugging (skip check when sampling since it's non-deterministic)
@@ -210,6 +218,37 @@ class TestLlamaBenchmark(BaseLlamaTest):
     hf_mean, hf_std = np.mean(hf_times)*1000, np.std(hf_times)*1000
     tiny_mean, tiny_std = np.mean(tiny_times)*1000, np.std(tiny_times)*1000
     print(f"\nAverage times: HF Torch={hf_mean:.2f}±{hf_std:.2f}ms, Tinygrad={tiny_mean:.2f}±{tiny_std:.2f}ms, Ratio={tiny_mean/hf_mean:.2f}")
+
+    # Compute and print Tinygrad memory bandwidth (GB/s) using GlobalCounters measurements
+    try:
+      # tiny_mems are bytes accessed per token
+      tiny_gbps = [(m * 1e-9) / t if t > 0 else 0.0 for m, t in zip(tiny_mems, tiny_times)]
+      tiny_gb_mean = np.mean(tiny_gbps)
+      tiny_gb_std = np.std(tiny_gbps)
+      print(f"Tinygrad memory bandwidth: {tiny_gb_mean:.2f}±{tiny_gb_std:.2f} GB/s (mean±std)")
+    except Exception:
+      pass
+
+    # Optionally plot token times
+    if PLOT:
+      try:
+        import matplotlib.pyplot as plt
+        n = min(len(hf_times), len(tiny_times))
+        x = np.arange(1, n+1)
+        hf_ms = np.array(hf_times[:n]) * 1000.0
+        tiny_ms = np.array(tiny_times[:n]) * 1000.0
+        plt.figure()
+        plt.plot(x, hf_ms, color='blue', label='HF Torch')
+        plt.plot(x, tiny_ms, color='red', label='Tinygrad')
+        plt.xlabel('Token')
+        plt.ylabel('Time (ms)')
+        plt.title(f'Per-token decoding time (BEAM={getenv("BEAM", 0)})')
+        plt.legend()
+        outfn = 'token_times.png'
+        plt.savefig(outfn, dpi=150)
+        print(f"Wrote token times plot to {outfn}")
+      except Exception as e:
+        print(f"Could not plot token times: {e}")
 
 if __name__ == "__main__":
   unittest.main(verbosity=2)

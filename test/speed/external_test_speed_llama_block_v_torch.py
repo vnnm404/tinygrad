@@ -470,17 +470,6 @@ class TestBlockLayers(unittest.TestCase):
     torch_freqs_slice = self.torch_freqs[:, start_pos:start_pos+SEQ_LEN, :, :, :]
     tiny_freqs_slice = self.tiny_freqs[:, start_pos:start_pos+SEQ_LEN, :, :, :]
 
-    # warm up the caches with identical random inputs
-    torch.manual_seed(42)
-    with torch.no_grad():
-      for i in range(start_pos):
-        warmup_x = torch.rand(1, 1, DIM, dtype=torch_dt).to(torch_device)
-        torch_block(warmup_x, i, self.torch_freqs[:, i:i+1, :, :, :])
-    torch.manual_seed(42)
-    for i in range(start_pos):
-      warmup_x = Tensor(torch.rand(1, 1, DIM, dtype=torch_dt).numpy())
-      tiny_block(warmup_x, i, self.tiny_freqs[:, i:i+1, :, :, :], None)
-
     def f1(x): return torch_block(x, start_pos, torch_freqs_slice)
     def f2(x): return tiny_block(x, start_pos, tiny_freqs_slice, None)
     helper_test_generic(f"transformer_block dim={DIM} hidden={HIDDEN_DIM}", f1, (self.torch_x,), TinyJit(f2), (self.tiny_x,))
