@@ -162,7 +162,9 @@ class TorchTransformer(nn.Module):
 # +----- End of Torch Port of extras/models/llama.py -----+
 
 def benchmark_torch(model, start_tok, warmup=10, iters=CNT):
-  """Benchmark torch model with greedy decoding - each generated token feeds back as input."""
+  cache_defeat = np.zeros((2048, 2048))
+  cache_defeat += 1
+
   toks = []
   with torch.no_grad():
     last_tok = start_tok
@@ -179,7 +181,9 @@ def benchmark_torch(model, start_tok, warmup=10, iters=CNT):
   return times, toks
 
 def benchmark_tinygrad(model, start_tok, warmup=10, iters=CNT):
-  """Benchmark tinygrad model with greedy decoding - each generated token feeds back as input."""
+  cache_defeat = np.zeros((2048, 2048))
+  cache_defeat += 1
+  
   toks = []
   tok_tensor = Tensor([[start_tok]]).realize()
   for i in range(warmup):
