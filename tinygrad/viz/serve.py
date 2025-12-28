@@ -6,7 +6,7 @@ from decimal import Decimal
 from urllib.parse import parse_qs, urlparse
 from typing import Any, TypedDict, TypeVar, Generator, Callable
 from tinygrad.helpers import colored, getenv, tqdm, unwrap, word_wrap, TRACEMETA, ProfileEvent, ProfileRangeEvent, TracingKey, ProfilePointEvent, temp
-from tinygrad.helpers import printable, system, TCPServerWithReuse, HTTPRequestHandler
+from tinygrad.helpers import printable, TCPServerWithReuse, HTTPRequestHandler
 from tinygrad.uop.ops import TrackedGraphRewrite, RewriteTrace, UOp, Ops, GroupOp, srender, sint, sym_infer, range_str, pyrender
 from tinygrad.uop.ops import print_uops, range_start, multirange_str
 from tinygrad.device import ProfileDeviceEvent, ProfileGraphEvent, ProfileGraphEntry, Device, ProfileProgramEvent
@@ -140,6 +140,8 @@ def option(s:int|None) -> int: return 0 if s is None else s+1
 device_ts_diffs:dict[str, tuple[Decimal, Decimal]] = {}
 def cpu_ts_diff(device:str, thread=0) -> Decimal: return device_ts_diffs.get(device, (Decimal(0),))[thread]
 
+device_props:dict[str, dict] = {}
+
 DevEvent = ProfileRangeEvent|ProfileGraphEntry|ProfilePointEvent
 def flatten_events(profile:list[ProfileEvent]) -> Generator[tuple[Decimal, Decimal, DevEvent], None, None]:
   for e in profile:
@@ -241,13 +243,11 @@ def load_counters(profile:list[ProfileEvent]) -> None:
   counter_events:dict[tuple[str, int], dict] = {}
   durations:dict[str, list[float]] = {}
   prg_events:dict[str, ProfileProgramEvent] = {}
-  dev_events:dict[str, ProfileDeviceEvent] = {}
   for e in profile:
     if isinstance(e, (ProfilePMCEvent, ProfileSQTTEvent)): counter_events.setdefault((e.kern, e.exec_tag), {}).setdefault(type(e), []).append(e)
     if isinstance(e, ProfileRangeEvent) and e.device.startswith("AMD") and e.en is not None:
       durations.setdefault(str(e.name), []).append(float(e.en-e.st))
     if isinstance(e, ProfileProgramEvent): prg_events[str(e.name)] = e
-    if isinstance(e, ProfileDeviceEvent): dev_events[e.device] = e
   if len(counter_events) == 0: return None
   ctxs.append({"name":"All Counters", "steps":[create_step("PMC", ("/all-pmc", len(ctxs), 0), (durations, all_counters:={}))]})
   run_number = {n:0 for n,_ in counter_events}
@@ -261,7 +261,7 @@ def load_counters(profile:list[ProfileEvent]) -> None:
       all_counters[(name, run_number[k], k)] = pmc[0]
     if (sqtt:=v.get(ProfileSQTTEvent)):
       # to decode a SQTT trace, we need the raw stream, program binary and device properties
-      steps.append(create_step("SQTT", ("/prg-sqtt", len(ctxs), len(steps)), ((k, tag), [*sqtt, prg_events[k], dev_events[sqtt[0].device]])))
+      steps.append(create_step("SQTT", ("/prg-sqtt", len(ctxs), len(steps)), ((k, tag), sqtt, prg_events[k])))
       if getenv("SQTT_PARSE"):
         # run our decoder on startup, we don't use this since it only works on gfx11
         from extra.sqtt.attempt_sqtt_parse import parse_sqtt_print_packets
@@ -270,11 +270,12 @@ def load_counters(profile:list[ProfileEvent]) -> None:
 
 # ** SQTT OCC only unpacks wave start, end time and SIMD location
 
-def unpack_sqtt(key:tuple[str, int], profile:list[ProfileEvent]) -> tuple[dict[str, list[ProfileEvent]], list[str], dict[str, dict[str, dict]]]:
+def unpack_sqtt(key:tuple[str, int], data:list, p:ProfileProgramEvent) -> tuple[dict[str, list[ProfileEvent]], list[str], dict[str, dict[str, dict]]]:
   # * init decoder
   from extra.sqtt.roc import decode
-  rctx = decode(profile)
-  disasm = rctx.disasms[key[0]]
+  base = unwrap(p.base)
+  disasm = {addr+base:inst_disasm for addr,inst_disasm in llvm_disasm(device_props[p.device]["gfx_target_version"], unwrap(p.lib)).items()}
+  rctx = decode(data, {p.name:disasm})
   cu_events:dict[str, list[ProfileEvent]] = {}
   # * INST waves
   wave_insts:dict[str, dict[str, dict]] = {}
@@ -309,6 +310,7 @@ def get_profile(profile:list[ProfileEvent], sort_fn:Callable[[str], Any]=device_
   for ev in profile:
     if isinstance(ev, ProfileDeviceEvent):
       device_ts_diffs[ev.device] = (ev.comp_tdiff,ev.copy_tdiff if ev.copy_tdiff is not None else ev.comp_tdiff)
+      if ev.props is not None: device_props[ev.device] = ev.props
       if (d:=ev.device.split(":")[0]) == "AMD": device_decoders[d] = load_counters
   # load device specific counters
   for fxn in device_decoders.values(): fxn(profile)
@@ -339,26 +341,6 @@ def get_profile(profile:list[ProfileEvent], sort_fn:Callable[[str], Any]=device_
 
 # ** Assembly static analyzers
 
-def get_llvm_mca(asm:str, mtriple:str, mcpu:str) -> dict:
-  target_args = f"-mtriple={mtriple} -mcpu={mcpu}"
-  # disassembly output can include headers / metadata, skip if llvm-mca can't parse those lines
-  data = json.loads(system("llvm-mca -skip-unsupported-instructions=parse-failure --json -"+target_args, input=asm.encode()))
-  cr = data["CodeRegions"][0]
-  resource_labels = [repr(x)[1:-1] for x in data["TargetInfo"]["Resources"]]
-  rows:list = [[instr] for instr in cr["Instructions"]]
-  # add scheduler estimates
-  for info in cr["InstructionInfoView"]["InstructionList"]: rows[info["Instruction"]].append(info["Latency"])
-  # map per instruction resource usage
-  instr_usage:dict[int, dict[int, int]] = {}
-  for d in cr["ResourcePressureView"]["ResourcePressureInfo"]:
-    instr_usage.setdefault(i:=d["InstructionIndex"], {}).setdefault(r:=d["ResourceIndex"], 0)
-    instr_usage[i][r] += d["ResourceUsage"]
-  # last row is the usage summary
-  summary = [{"idx":k, "label":resource_labels[k], "value":v} for k,v in instr_usage.pop(len(rows), {}).items()]
-  max_usage = max([sum(v.values()) for i,v in instr_usage.items() if i<len(rows)], default=0)
-  for i,usage in instr_usage.items(): rows[i].append([[k, v, (v/max_usage)*100] for k,v in usage.items()])
-  return {"rows":rows, "cols":["Instruction", "Latency", {"title":"HW Resources", "labels":resource_labels}], "metadata":[summary]}
-
 def get_stdout(f: Callable) -> str:
   buf = io.StringIO()
   try:
@@ -378,7 +360,7 @@ def amd_readelf(lib:bytes) -> list[dict]:
           ".group_segment_fixed_size":"LDS size", ".private_segment_fixed_size":"Scratch size"}
   return [{"label":label, "value":v} for k,label in keys.items() if (v:=notes["amdhsa.kernels"][0][k]) > 0]
 
-def llvm_disasm(arch:str, lib:bytes) -> dict[int, tuple[str, int]]:
+def llvm_disasm(target:int, lib:bytes) -> dict[int, tuple[str, int]]:
   from tinygrad.runtime.autogen import llvm
   from tinygrad.runtime.support.elf import elf_loader
   llvm.LLVMInitializeAMDGPUTargetInfo()
@@ -387,6 +369,7 @@ def llvm_disasm(arch:str, lib:bytes) -> dict[int, tuple[str, int]]:
   llvm.LLVMInitializeAMDGPUDisassembler()
   # pass NULL to callbacks
   cbs = [ctypes.cast(0, llvm.LLVMCreateDisasmCPUFeatures.argtypes[i]) for i in {5,6}]
+  arch = "gfx%d%x%x" % (target // 10000, (target // 100) % 100, target % 100)
   ctx = llvm.LLVMCreateDisasmCPUFeatures("amdgcn-amd-amdhsa".encode(), arch.encode(), "".encode(), None, 0, *cbs)
   image, sections, _ = elf_loader(lib)
   text = next((sh.header for sh in sections if sh.name == ".text"), None)
@@ -412,9 +395,9 @@ def parse_branch(asm:str) -> int|None:
 
 COND_TAKEN, COND_NOT_TAKEN, UNCOND = range(3)
 cfg_colors = {COND_TAKEN: "#3f7564", COND_NOT_TAKEN: "#7a4540", UNCOND: "#3b5f7e"}
-def amdgpu_cfg(lib:bytes, arch:str) -> dict:
+def amdgpu_cfg(lib:bytes, target:int) -> dict:
   # disassemble
-  pc_table = llvm_disasm(arch, lib)
+  pc_table = llvm_disasm(target, lib)
   # get leaders
   leaders:set[int] = {next(iter(pc_table))}
   for pc, (asm, sz) in pc_table.items():
@@ -447,17 +430,12 @@ def get_render(i:int, j:int, fmt:str) -> dict:
   if fmt == "uops": return {"src":get_stdout(lambda: print_uops(data.uops or [])), "lang":"txt"}
   if fmt == "code": return {"src":data.src, "lang":"cpp"}
   if fmt == "asm":
-    compiler = Device[data.device].compiler
-    disasm_str = get_stdout(lambda: compiler.disassemble(compiler.compile(data.src)))
-    from tinygrad.runtime.support.compiler_cpu import llvm, LLVMCompiler
-    if isinstance(compiler, LLVMCompiler):
-      return get_llvm_mca(disasm_str, ctypes.string_at(llvm.LLVMGetTargetMachineTriple(tm:=compiler.target_machine)).decode(),
-                          ctypes.string_at(llvm.LLVMGetTargetMachineCPU(tm)).decode())
-    ret:dict = {"src":disasm_str}
-    if data.device.startswith("AMD"):
+    ret:dict = {"metadata":[]}
+    if data.device.startswith("AMD") and data.lib is not None:
       with soft_err(lambda err: ret.update(err)):
-        metadata = amd_readelf(lib:=compiler.compile(data.src))
-        ret = {"data":amdgpu_cfg(lib, getattr(compiler, "arch")), "metadata":[metadata]}
+        ret["data"] = amdgpu_cfg(lib:=data.lib, device_props[data.device]["gfx_target_version"])
+        with soft_err(lambda err: ret["metadata"].append(err)): ret["metadata"].append(amd_readelf(lib))
+    else: ret["src"] = get_stdout(lambda: (compiler:=Device[data.device].compiler).disassemble(compiler.compile(data.src)))
     return ret
   if fmt == "all-pmc":
     durations, pmc = data
